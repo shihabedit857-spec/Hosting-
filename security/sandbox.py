@@ -1,13 +1,13 @@
 """
-UNIFIED SANDBOX v2.0 — Jail + Per-User Quota Terminal
+UNIFIED SANDBOX v2.1 — Per-plan rlimits + Jail + Quota Terminal
 ═══════════════════════════════════════════════════════════════════
 Layer-1: run_sandboxed() — spawn bot inside bwrap jail
 Layer-2: get_terminal() — PTY shell inside same jail with quota
-Both share: bwrap args, clean env, rlimits, dir hardening
+Both share: bwrap args, clean env, per-plan rlimits, dir hardening
 ═══════════════════════════════════════════════════════════════════
 """
 from __future__ import annotations
-import os, sys, re, shlex, select, shutil, signal, time
+import os, sys, re, shlex, select, shutil, signal, time, functools
 import logging, subprocess, threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -31,18 +31,14 @@ _UNSHARE   = shutil.which('unshare')
 
 
 def _probe_cmd(cmd, timeout=3) -> bool:
-    """Return True only if cmd runs and exits 0 (permission actually works)."""
     try:
-        r = subprocess.run(
-            cmd, capture_output=True, timeout=timeout,
-            stdin=subprocess.DEVNULL,
-        )
+        r = subprocess.run(cmd, capture_output=True, timeout=timeout,
+                           stdin=subprocess.DEVNULL)
         return r.returncode == 0
     except Exception:
         return False
 
 
-# Probe once at import — many hosts ship `unshare` but block namespaces
 _BWRAP_OK = bool(_BWRAP_BIN) and _probe_cmd(
     [_BWRAP_BIN, '--ro-bind', '/', '/', '--dev', '/dev',
      '--unshare-pid', '--die-with-parent', 'true']
@@ -53,18 +49,9 @@ _UNSHARE_OK = bool(_UNSHARE) and _probe_cmd(
 ) if _UNSHARE else False
 
 if _UNSHARE and not _UNSHARE_OK:
-    # Avoid noisy "Operation not permitted" on every bot start
-    pass  # logged below after logger is ready
-
-
-# ═══════════════════════════════════════════════════
-#  RLIMITS
-# ═══════════════════════════════════════════════════
-
-if _UNSHARE and not _UNSHARE_OK:
-    logger.warning("[sandbox] unshare binary found but NOT permitted — using rlimits-only")
+    logger.warning("[sandbox] unshare present but NOT permitted")
 if _BWRAP_BIN and not _BWRAP_OK:
-    logger.warning("[sandbox] bwrap binary found but NOT permitted — skipped")
+    logger.warning("[sandbox] bwrap present but NOT permitted")
 if _BWRAP_OK:
     logger.info("[sandbox] capability: bwrap OK")
 elif _UNSHARE_OK:
@@ -72,53 +59,62 @@ elif _UNSHARE_OK:
 else:
     logger.info("[sandbox] capability: rlimits-only (safe fallback)")
 
-class SandboxLimits:
+
+# ═══════════════════════════════════════════════════
+#  RLIMITS — per-plan
+# ═══════════════════════════════════════════════════
+class SandboxDefaults:
+    """Fallback values if caller doesn't pass plan-specific limits."""
     CPU_SECONDS   = 3600
-    ADDRESS_SPACE = 512 * 1024 * 1024
+    ADDRESS_SPACE = 512 * 1024 * 1024      # 512 MB
     DATA_SEGMENT  = 256 * 1024 * 1024
-    STACK_SIZE    = 8   * 1024 * 1024
+    STACK_SIZE    = 16 * 1024 * 1024
     NUM_PROCS     = 32
     NUM_FILES     = 256
     FILE_SIZE     = 100 * 1024 * 1024
     CORE_DUMP     = 0
 
 
-def _apply_rlimits():
-    """Applied in child process before exec — limits + no privilege escalation."""
+def _apply_rlimits(ram_mb: int = None, cpu_sec: int = None, procs: int = None):
+    """
+    Applied in the child process before exec.
+    ram_mb, cpu_sec, procs are plan-specific (caller passes via functools.partial).
+    If any is None, fall back to SandboxDefaults.
+    """
     try:
         os.setsid()
     except Exception:
         pass
 
-    # Prevent gaining new privileges (setuid binaries, capabilities)
+    # Prevent privilege escalation
     try:
         import ctypes
         libc = ctypes.CDLL("libc.so.6", use_errno=True)
-        PR_SET_NO_NEW_PRIVS = 38
-        libc.prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0)
-    except Exception:
-        pass
-
-    # Drop ambient / inheritable capabilities if libcap available
-    try:
-        import ctypes
-        libc = ctypes.CDLL("libc.so.6", use_errno=True)
-        # PR_CAP_AMBIENT = 47, PR_CAP_AMBIENT_CLEAR_ALL = 4
-        libc.prctl(47, 4, 0, 0, 0)
+        libc.prctl(38, 1, 0, 0, 0)   # PR_SET_NO_NEW_PRIVS
+        libc.prctl(47, 4, 0, 0, 0)   # PR_CAP_AMBIENT_CLEAR_ALL
     except Exception:
         pass
 
     if resource is None:
         return
+
+    ram_mb  = int(ram_mb)  if ram_mb  else (SandboxDefaults.ADDRESS_SPACE // (1024*1024))
+    cpu_sec = int(cpu_sec) if cpu_sec else SandboxDefaults.CPU_SECONDS
+    procs   = int(procs)   if procs   else SandboxDefaults.NUM_PROCS
+
+    ram_bytes = ram_mb * 1024 * 1024
+    nfiles    = 1024 if ram_mb >= 512 else 512
+    stack     = min(16 * 1024 * 1024, ram_bytes // 8)
+
     for name, val in (
-        ('RLIMIT_CPU',    SandboxLimits.CPU_SECONDS),
-        ('RLIMIT_AS',     SandboxLimits.ADDRESS_SPACE),
-        ('RLIMIT_DATA',   SandboxLimits.DATA_SEGMENT),
-        ('RLIMIT_STACK',  SandboxLimits.STACK_SIZE),
-        ('RLIMIT_NPROC',  SandboxLimits.NUM_PROCS),
-        ('RLIMIT_NOFILE', SandboxLimits.NUM_FILES),
-        ('RLIMIT_FSIZE',  SandboxLimits.FILE_SIZE),
-        ('RLIMIT_CORE',   SandboxLimits.CORE_DUMP),
+        ('RLIMIT_CPU',    cpu_sec),
+        ('RLIMIT_AS',     ram_bytes),               # ← plan RAM
+        ('RLIMIT_DATA',   ram_bytes * 3 // 4),      # 75% of plan RAM
+        ('RLIMIT_STACK',  stack),
+        ('RLIMIT_NPROC',  procs),                    # ← plan procs
+        ('RLIMIT_NOFILE', nfiles),
+        ('RLIMIT_FSIZE',  SandboxDefaults.FILE_SIZE),
+        ('RLIMIT_CORE',   SandboxDefaults.CORE_DUMP),
     ):
         res = getattr(resource, name, None)
         if res is None:
@@ -145,22 +141,12 @@ _SECRET_FRAGMENTS = ('SECRET', 'PASSWORD', 'PASSWD', 'API_KEY',
 
 def _build_clean_env(base_env: Dict[str, str], bot_dir: Path,
                      extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
-    """
-    Minimal env for sandboxed bots.
-    Host panel secrets (OWNER_ID, MONGO, main BOT_TOKEN, …) are NEVER passed.
-    HOME/PWD locked to bot_dir so relative paths stay inside the jail.
-    """
-    # Start almost empty — only safe system vars
-    allow_pass = {
-        'PATH', 'LANG', 'LC_ALL', 'LC_CTYPE', 'TZ',
-        'PYTHONPATH',  # will override below
-    }
+    allow_pass = {'PATH', 'LANG', 'LC_ALL', 'LC_CTYPE', 'TZ', 'PYTHONPATH'}
     clean: Dict[str, str] = {}
     for k, v in (base_env or {}).items():
         if k in allow_pass:
             clean[k] = v
 
-    # Force jail identity
     clean['HOME']   = str(bot_dir)
     clean['PWD']    = str(bot_dir)
     clean['TMPDIR'] = str(bot_dir / '.tmp_run')
@@ -175,13 +161,11 @@ def _build_clean_env(base_env: Dict[str, str], bot_dir: Path,
     clean['PIP_DISABLE_PIP_VERSION_CHECK'] = '1'
     clean['NODE_ENV'] = 'production'
     clean['TERM'] = 'xterm-256color'
-    # Hint to user code that it is sandboxed (optional)
     clean['APON_SANDBOX'] = '1'
     clean['APON_BOT_DIR'] = str(bot_dir)
 
     if extra:
         for k, v in extra.items():
-            # User bot may receive ITS OWN token only
             if k == 'BOT_TOKEN':
                 clean[k] = str(v)
                 continue
@@ -198,12 +182,6 @@ def _build_clean_env(base_env: Dict[str, str], bot_dir: Path,
 #  BWRAP BUILDER
 # ═══════════════════════════════════════════════════
 def _build_bwrap_args(bot_dir: Path) -> List[str]:
-    """
-    Bubblewrap jail:
-      • bot_dir is the ONLY writable path
-      • host home / panel dirs are NOT mounted
-      • new PID/IPC/UTS/cgroup namespaces
-    """
     if not _BWRAP_BIN:
         return []
     home_dir = bot_dir / '.home'
@@ -222,7 +200,6 @@ def _build_bwrap_args(bot_dir: Path) -> List[str]:
     ]
     if os.path.isdir('/lib64'):
         args += ['--ro-bind', '/lib64', '/lib64']
-    # Minimal /etc — resolv.conf for DNS only
     args += [
         '--ro-bind', '/etc/resolv.conf', '/etc/resolv.conf',
         '--ro-bind', '/etc/hosts', '/etc/hosts',
@@ -233,7 +210,6 @@ def _build_bwrap_args(bot_dir: Path) -> List[str]:
         '--tmpfs', '/var',
         '--tmpfs', '/home',
         '--tmpfs', '/root',
-        # ONLY this bot folder is writable
         '--bind', str(bot_dir), str(bot_dir),
         '--bind', str(home_dir), '/home/bot',
         '--bind', str(tmp_dir), str(tmp_dir),
@@ -291,7 +267,15 @@ def _scan_escape_attempts(bot_dir: Path) -> List[str]:
 def run_sandboxed(bot_dir: Path, cmd: List[str],
                   user_env: Optional[Dict[str, str]] = None,
                   log_file=None, bot_id: Optional[str] = None,
-                  on_scan_alert=None, **_) -> subprocess.Popen:
+                  on_scan_alert=None,
+                  ram_mb: int = 512,
+                  cpu_sec: int = 3600,
+                  procs: int = 32,
+                  **_) -> subprocess.Popen:
+    """
+    ram_mb, cpu_sec, procs — plan-specific limits from config.resolve_limits().
+    Defaults are safe for free plan.
+    """
     bot_dir = Path(bot_dir).resolve()
     bot_dir.mkdir(parents=True, exist_ok=True)
     (bot_dir / '.tmp_run').mkdir(exist_ok=True)
@@ -300,14 +284,14 @@ def run_sandboxed(bot_dir: Path, cmd: List[str],
 
     env = _build_clean_env(dict(os.environ), bot_dir, user_env)
 
-    # Inject filesystem jail (Python bots only — sitecustomize + fs_jail)
+    # Filesystem jail
     try:
         _jail_dir = str(Path(__file__).resolve().parent)
-        _pp = env.get('PYTHONPATH', '')
-        deps = str(Path(bot_dir) / '.deps')
+        deps = str(bot_dir / '.deps')
         parts = [_jail_dir]
         if os.path.isdir(deps):
             parts.append(deps)
+        _pp = env.get('PYTHONPATH', '')
         if _pp:
             parts.append(_pp)
         env['PYTHONPATH'] = os.pathsep.join(parts)
@@ -316,8 +300,12 @@ def run_sandboxed(bot_dir: Path, cmd: List[str],
     except Exception:
         pass
 
-    # Prefer bwrap → unshare → rlimits-only. If unshare is present but
-    # the kernel denies it (common in containers), fall back automatically.
+    # Pre-exec with plan limits
+    preexec = (
+        functools.partial(_apply_rlimits, ram_mb, cpu_sec, procs)
+        if _IS_LINUX else None
+    )
+
     modes_try = []
     if _BWRAP_OK:
         modes_try.append(('bwrap-jailed',
@@ -330,54 +318,50 @@ def run_sandboxed(bot_dir: Path, cmd: List[str],
 
     proc = None
     mode = 'rlimits-only'
-    last_err = None
-    for mode, final_cmd in modes_try:
+    for m, final_cmd in modes_try:
         try:
             proc = subprocess.Popen(
                 final_cmd, cwd=str(bot_dir), env=env,
                 stdout=log_file if log_file is not None else subprocess.PIPE,
                 stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-                preexec_fn=_apply_rlimits if _IS_LINUX else None,
+                preexec_fn=preexec,
                 close_fds=True,
             )
-            # If unshare immediately exits with error, try next mode
-            if mode == 'unshare-jailed':
+            if m == 'unshare-jailed':
                 try:
                     ret = proc.poll()
                     if ret is not None and ret != 0:
-                        # unshare failed fast (e.g. Operation not permitted)
-                        out = b''
                         try:
                             out = proc.communicate(timeout=1)[0] or b''
                         except Exception:
-                            pass
+                            out = b''
                         logger.warning(
                             f"[sandbox] unshare failed (exit={ret}): "
                             f"{out[:200]!r} — falling back")
-                        last_err = ret
                         proc = None
                         continue
                 except Exception:
                     pass
+            mode = m
             break
         except OSError as e:
-            logger.warning(f"[sandbox] {mode} spawn failed: {e}")
-            last_err = e
+            logger.warning(f"[sandbox] {m} spawn failed: {e}")
             proc = None
             continue
 
     if proc is None:
-        # Last resort: plain spawn
         mode = 'rlimits-only'
         proc = subprocess.Popen(
             list(cmd), cwd=str(bot_dir), env=env,
             stdout=log_file if log_file is not None else subprocess.PIPE,
             stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-            preexec_fn=_apply_rlimits if _IS_LINUX else None,
+            preexec_fn=preexec,
             close_fds=True,
         )
 
-    logger.info(f"[sandbox] spawn mode={mode} bot={bot_id or bot_dir.name}")
+    logger.info(
+        f"[sandbox] spawn mode={mode} bot={bot_id or bot_dir.name} "
+        f"ram={ram_mb}MB procs={procs} cpu={cpu_sec}s")
 
     if bot_id is not None and on_scan_alert:
         stop_evt = threading.Event()
@@ -412,7 +396,7 @@ def install_hint() -> str:
     if _BWRAP_OK: return "bubblewrap active — MAX isolation"
     if _UNSHARE_OK: return "unshare active — kernel namespaces"
     if _UNSHARE or _BWRAP_BIN:
-        return "rlimits only — unshare/bwrap present but not permitted on this host"
+        return "rlimits only — unshare/bwrap present but not permitted"
     return "only rlimits — install bubblewrap for MAX isolation"
 
 
@@ -420,7 +404,6 @@ def install_hint() -> str:
 #  DISK USAGE
 # ═══════════════════════════════════════════════════
 def dir_size_mb(path: str, max_files: int = 200_000) -> float:
-    """Accurate recursive size in MB (follows real files, skips junk dirs)."""
     total = 0
     count = 0
     skip_dirs = {'.tmp_run', '.home', '__pycache__', '.git',
@@ -449,8 +432,7 @@ def dir_size_mb(path: str, max_files: int = 200_000) -> float:
 
 
 # ═══════════════════════════════════════════════════
-#  TERMINAL COMMAND RULES — jail to bot_dir only
-#  No root, no main-panel files, no other users' bots
+#  TERMINAL COMMAND RULES
 # ═══════════════════════════════════════════════════
 ALLOWED_CMDS = {
     'ls', 'cat', 'head', 'tail', 'wc', 'grep', 'find', 'file', 'stat',
@@ -464,7 +446,6 @@ ALLOWED_CMDS = {
     'diff', 'cmp', 'timeout', 'sleep',
     'curl', 'wget',
     'ps', 'free',
-    # intentionally NO: sudo, su, chmod, ln, kill, pkill, env, df, nano/vi
 }
 
 WRITE_TOKENS = (
@@ -476,7 +457,6 @@ WRITE_TOKENS = (
     ' git clone', ' git pull', ' git fetch',
 )
 
-# Paths / actions that must never run in user terminal
 HARD_BAN = [
     r'\bsudo\b', r'\bsu\b(?:\s|$)', r'\bdoas\b', r'\bsudoedit\b',
     r'\bchroot\b', r'\bmount\b', r'\bumount\b', r'\bnsenter\b',
@@ -489,22 +469,21 @@ HARD_BAN = [
     r'/etc/passwd', r'/etc/shadow', r'/etc/sudoers', r'/etc/ssh',
     r'(?:^|\s)/root(?:/|\s|$)', r'/proc/sys', r'/sys/',
     r'/proc/self/environ', r'/proc/\d+/mem',
-    r'\.\./\.\.',                          # any parent climb
+    r'\.\./\.\.',
     r'rm\s+-rf\s+/',
     r':\(\)\s*\{',
     r'>\s*/dev/sd[a-z]',
     r'\bdd\s+',
     r'\bmkfs\b', r'\bmknod\b', r'\binsmod\b', r'\bmodprobe\b',
     r'\bnc\s+', r'\bnetcat\s+', r'\bnmap\b',
-    r'\bchmod\s+[0-7]*[675]',              # setuid/setgid bits
+    r'\bchmod\s+[0-7]*[675]',
     r'\bchown\b', r'\bchgrp\b',
     r'\bln\s+-s', r'\bsymlink\b',
     r'\bkill\b', r'\bpkill\b', r'\bkillall\b',
-    r'\bpython[0-9.]*\s+-c\b',             # inline python escape
+    r'\bpython[0-9.]*\s+-c\b',
     r'\bnode\s+-e\b',
     r'\beval\b', r'\bexec\s+/',
     r'\bbash\s+-i\b', r'\bsh\s+-i\b',
-    # Main panel / host secrets
     r'config\.py\b', r'\bTOKEN\b', r'MONGO_URL', r'OWNER_ID',
     r'apon_data\b', r'upload_bots\b', r'\.env\b',
     r'bot_token', r'ERROR_BOT_TOKEN',
@@ -512,7 +491,6 @@ HARD_BAN = [
 
 
 def _panel_roots() -> List[Path]:
-    """Absolute paths the terminal must never touch."""
     roots = []
     try:
         from config import BASE_DIR, DATA_DIR, LOGS_DIR, BACKUP_DIR
@@ -523,7 +501,6 @@ def _panel_roots() -> List[Path]:
                 pass
     except Exception:
         pass
-    # Always block typical host roots
     for p in ('/root', '/etc', '/proc', '/sys', '/var/log', '/home'):
         roots.append(Path(p))
     return roots
@@ -538,19 +515,12 @@ def _path_inside(child: Path, parent: Path) -> bool:
 
 
 def _escape_jail(path_str: str, bot_dir: Path) -> Optional[str]:
-    """
-    Return a reason string if path escapes bot_dir or hits panel/system.
-    Relative paths are resolved against bot_dir.
-    """
     if not path_str or path_str in ('.', './'):
         return None
-    # skip pure flags / options
     if path_str.startswith('-') and '/' not in path_str:
         return None
-    # skip URLs
     if '://' in path_str:
         return None
-
     raw = path_str
     try:
         if os.path.isabs(raw):
@@ -559,32 +529,13 @@ def _escape_jail(path_str: str, bot_dir: Path) -> Optional[str]:
             target = (bot_dir / raw).resolve()
     except Exception:
         return f"invalid path: {raw[:40]}"
-
-    # must stay under bot_dir
     if not _path_inside(target, bot_dir):
         return f"outside bot folder: {raw[:50]}"
-
-    # never touch panel / system roots even if somehow nested
-    for root in _panel_roots():
-        try:
-            # if target IS a panel root or is outside bot but under panel
-            if target == root or str(target).startswith(str(root) + os.sep):
-                # allow only if that root is inside bot_dir (impossible for /etc etc.)
-                if not _path_inside(root, bot_dir):
-                    # only block if path actually leaves bot_dir (already checked)
-                    # extra: block reading host config filenames by name
-                    pass
-        except Exception:
-            pass
-
-    # block sensitive filenames anywhere
     name = target.name.lower()
     if name in ('config.py', '.env', 'token', 'credentials', 'id_rsa',
                 'shadow', 'passwd', 'sudoers'):
-        # allow only if strictly inside bot_dir AND not panel copy
         if not _path_inside(target, bot_dir):
             return f"sensitive file blocked: {name}"
-
     return None
 
 
@@ -608,26 +559,33 @@ def _is_banned(cmd: str) -> Optional[str]:
 # ═══════════════════════════════════════════════════
 class IsolatedTerminal:
     def __init__(self, bot_id: str, bot_dir: Path,
-                 user_dir: Path, quota_mb: int):
+                 user_dir: Path, quota_mb: int,
+                 ram_mb: int = 512, procs: int = 32):
         self.bot_id   = bot_id
         self.bot_dir  = Path(bot_dir).resolve()
         self.user_dir = Path(user_dir).resolve()
         self.quota_mb = int(quota_mb)
+        self.ram_mb   = int(ram_mb)
+        self.procs    = int(procs)
         self.master_fd: Optional[int] = None
         self.proc: Optional[subprocess.Popen] = None
         self.buffer: List[str] = []
         self.lock   = threading.Lock()
         self.alive  = False
-        self.simple = False   # True = one-shot cmd mode (no PTY)
+        self.simple = False
         self.reader: Optional[threading.Thread] = None
         self.watcher: Optional[threading.Thread] = None
         self._stop_evt = threading.Event()
         self.blocked_by_quota = False
 
     def start(self) -> bool:
-        """Start interactive PTY shell; fall back to simple one-shot mode."""
         _harden_dir_perms(self.bot_dir)
         self._stop_evt.clear()
+
+        preexec = (
+            functools.partial(_apply_rlimits, self.ram_mb, 1800, self.procs)
+            if _IS_LINUX else None
+        )
 
         if _PTY_OK and _IS_LINUX:
             try:
@@ -645,7 +603,7 @@ class IsolatedTerminal:
                 self.proc = subprocess.Popen(
                     full_cmd, cwd=str(self.bot_dir), env=env,
                     stdin=slave_fd, stdout=slave_fd, stderr=slave_fd,
-                    preexec_fn=_apply_rlimits if _IS_LINUX else None,
+                    preexec_fn=preexec,
                     close_fds=True)
                 os.close(slave_fd)
                 self.master_fd = master_fd
@@ -659,12 +617,13 @@ class IsolatedTerminal:
                     target=self._quota_watch, daemon=True, name=f"quota-{self.bot_id}")
                 self.watcher.start()
 
-                logger.info(f"[term] mode={mode} bot={self.bot_id} quota={self.quota_mb}MB")
+                logger.info(
+                    f"[term] mode={mode} bot={self.bot_id} "
+                    f"quota={self.quota_mb}MB ram={self.ram_mb}MB procs={self.procs}")
                 return True
             except Exception as e:
                 logger.warning(f"[term] PTY start failed ({e}) — using simple mode")
 
-        # Simple one-shot mode (no interactive shell)
         self.simple = True
         self.alive = True
         self.watcher = threading.Thread(
@@ -709,12 +668,6 @@ class IsolatedTerminal:
             except Exception: pass
 
     def send(self, raw_cmd: str) -> Tuple[bool, str]:
-        """
-        Run a command jailed inside self.bot_dir.
-        No root / sudo / system tools.
-        Paths outside bot_dir are rejected.
-        Main panel files unreachable.
-        """
         if not self.alive:
             return False, "terminal not running"
         if not self.simple and self.master_fd is None:
@@ -768,6 +721,11 @@ class IsolatedTerminal:
         with self.lock:
             self.buffer.clear()
 
+        preexec = (
+            functools.partial(_apply_rlimits, self.ram_mb, 1800, self.procs)
+            if _IS_LINUX else None
+        )
+
         if self.simple or self.master_fd is None:
             try:
                 env = _build_clean_env(dict(os.environ), self.bot_dir)
@@ -777,7 +735,7 @@ class IsolatedTerminal:
                     ["/bin/bash", "--noprofile", "--norc", "-c", cmd],
                     cwd=str(self.bot_dir), env=env,
                     capture_output=True, text=True, timeout=30,
-                    preexec_fn=_apply_rlimits if _IS_LINUX else None,
+                    preexec_fn=preexec,
                 )
                 out = (r.stdout or "") + (r.stderr or "")
                 if not out.strip():
@@ -833,13 +791,16 @@ _TERM_LOCK = threading.Lock()
 
 
 def get_terminal(bot_id: str, bot_dir: Path,
-                 user_dir: Path, quota_mb: int) -> IsolatedTerminal:
+                 user_dir: Path, quota_mb: int,
+                 ram_mb: int = 512, procs: int = 32) -> IsolatedTerminal:
     with _TERM_LOCK:
         t = _TERMINALS.get(bot_id)
         if t and t.alive:
             t.quota_mb = int(quota_mb)
+            t.ram_mb   = int(ram_mb)
+            t.procs    = int(procs)
             return t
-        t = IsolatedTerminal(bot_id, bot_dir, user_dir, quota_mb)
+        t = IsolatedTerminal(bot_id, bot_dir, user_dir, quota_mb, ram_mb, procs)
         t.start()
         _TERMINALS[bot_id] = t
         return t
