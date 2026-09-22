@@ -1,8 +1,8 @@
 """CONFIG — Full with disk_mb quota + ADMIN_LIMITS"""
 import os
 
-TOKEN            = '8653992436:AAHmBSESimnzOxZT7mshxw0X3CQLfXPEbZs'
-ERROR_BOT_TOKEN  = '8677777628:AAHHbVdhmWOt_39KnTkjwbjd_4cY8PiBTFg'
+TOKEN            = '8653992436:AAG5nV2X37wbkLzZqIfPzOu9Qn6cwW6Vrd0'
+ERROR_BOT_TOKEN  = '8510538370:AAGr6HCGB5Z1VaO95UzSGmMy0908c3xizYw'
 
 if not TOKEN:
     raise ValueError("❌ BOT_TOKEN is not set!")
