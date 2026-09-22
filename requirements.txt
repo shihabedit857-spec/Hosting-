@@ -1,31 +1,34 @@
-# ══════════════════════════════════════════
-#  🌟 APON HOSTING PANEL v6.0
-#  Production Dependencies — Vortexa Ready
-# ══════════════════════════════════════════
+# ══════════════════════════════════════════════════════
+#  🌟 SB HOSTING PANEL v6.5 — Maximum Security
+#  Production Dependencies
+# ══════════════════════════════════════════════════════
 
-# ── Core Bot Library ──
+# ── Core Bot Library ──────────────────────────────────
 pyTelegramBotAPI==4.21.0
 
-# ── Web Server (Keep-Alive) ──
+# ── Web Server (Keep-Alive / Health) ──────────────────
 Flask==3.0.3
 Werkzeug==3.0.4
 
-# ── System Monitoring ──
+# ── System Monitoring (RLIMIT + PSUTIL for sandbox) ───
 psutil==6.0.0
 
-# ── HTTP Requests (also used by Redis client) ──
+# ── HTTP Requests ─────────────────────────────────────
 requests==2.32.3
 urllib3==2.2.3
 
-# ── MongoDB (Primary DB) ──
+# ── MongoDB (Primary Database) ────────────────────────
 pymongo==4.7.2
 dnspython==2.6.1
 
-# ── Security & Utilities ──
+# ── Security & Crypto Utilities ───────────────────────
 cryptography==43.0.1
 
-# ── Environment Variables ──
+# ── Environment Variables ─────────────────────────────
 python-dotenv==1.0.1
 
-# ── Process Management ──
+# ── Process Management / Build ────────────────────────
 setuptools>=70.0.0
+
+# ── Concurrent Futures (bulk broadcast) ───────────────
+# Already in Python stdlib — no install needed
